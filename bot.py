@@ -12,7 +12,7 @@ from telebot import TeleBot, types
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or "8834283543:AAH26mFLUbr8PaFEFglqgERnvM1ArKlnhPU"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or "8834283543:AAHtCCajH7tktstOgE2Qdy3ZyaWaXwmGCfc"
 CHAT_ID = os.getenv("CHAT_ID") or "-1004453763468"
 SCAN_INTERVAL_SECONDS = 30
 
@@ -21,11 +21,9 @@ PDF_DATABASE = ""
 ACTIVE_TRADES = {}
 
 # বটের ইনপুট প্যারামিটারস (কনফিগারেশন)
-MA_TYPE = "EMA"          
-MA_LENGTH = 50          
-VOL_SMA_LENGTH = 14     
-LEVERAGE = 50           # আপনার চাহিদা অনুযায়ী ৫০এক্স লেভারেজ সেট করা হয়েছে
-RISK_REWARD_RATIO = 2.5 # ফিক্সড রিস্ক-রিওয়ার্ড রেশিও (১ : ২.৫)
+VOL_SMA_LENGTH = 14     # আপনার চাহিদা অনুযায়ী ভলিউম SMA দৈর্ঘ্য ১৪ রাখা হলো
+LEVERAGE = 50           
+RISK_REWARD_RATIO = 2.5 
 
 # উন্নত স্ট্যাটিস্টিকস ডাটাবেজ
 STATS_DB = {
@@ -52,8 +50,9 @@ def set_bot_commands():
             types.BotCommand("close", "ম্যানুয়াল ক্লোজ (উদা: /close SOL)")
         ]
         bot.set_my_commands(commands)
-    except:
-        pass
+        print("[INIT] Bot commands set successfully.", flush=True)
+    except Exception as e:
+        print(f"[INIT ERROR] Failed to set commands: {e}", flush=True)
 
 def load_pdf_from_telegram_channel():
     global PDF_DATABASE
@@ -63,7 +62,8 @@ def scan_all_binance_futures():
     try:
         res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10).json()
         return [t for t in res if t['symbol'].endswith('USDT')]
-    except:
+    except Exception as e:
+        print(f"[API ERROR] Binance 24hr ticker failed: {e}", flush=True)
         return []
 
 def filter_scalping_coins(all_coins):
@@ -87,19 +87,16 @@ def get_klines_dataframe(symbol, timeframe, limit=500):
         df['close'] = df['close'].astype(float)
         df['volume'] = df['volume'].astype(float)
         return df
-    except:
+    except Exception as e:
+        print(f"[API ERROR] Failed to fetch klines for {symbol}: {e}", flush=True)
         return None
 
 def calculate_indicators(df):
-    if MA_TYPE == "EMA":
-        df['MA'] = df['close'].ewm(span=MA_LENGTH, adjust=False).mean()
-    else:
-        df['MA'] = df['close'].rolling(window=MA_LENGTH).mean()
+    # শুধুমাত্র ভলিউম SMA ১৪ ক্যালকুলেট করা হচ্ছে, অন্য কোনো প্রাইস MA রাখা হয়নি
     df['Vol_SMA'] = df['volume'].rolling(window=VOL_SMA_LENGTH).mean()
     return df
 
 def detect_chart_patterns(df):
-    """চার্ট প্যাটার্ন ডিটেকশন এবং প্যাটার্ন ভিত্তিক SL লেভেল নির্ধারণ"""
     if len(df) < 100:
         return None, "Neutral", None
         
@@ -122,7 +119,6 @@ def detect_chart_patterns(df):
     lowest_low = min(troughs) if troughs else c['low']
     highest_high = max(peaks) if peaks else c['high']
 
-    # ১. ক্যান্ডেলস্টিক এবং ক্যান্ডেল ভিত্তিক SL (ক্যান্ডেলের হাই/লো-র সামান্য বাইরে)
     if c['close'] > c['open'] and p['open'] > p['close'] and c['close'] > p['open'] and c['open'] < p['close']:
         return "Bullish Engulfing", "Buy", min(c['low'], p['low']) * 0.998
     if c['close'] < c['open'] and p['close'] > p['open'] and c['close'] < p['open'] and c['open'] > p['close']:
@@ -132,7 +128,6 @@ def detect_chart_patterns(df):
     if upper_wick > (body * 2.5) and lower_wick < (body * 0.5):
         return "Shooting Star (Bearish)", "Sell", c['high'] * 1.002
 
-    # ২. চার্ট প্যাটার্ন ভিত্তিক SL (প্যাটার্নের মূল সুইং হাই বা সুইং লো অনুযায়ী)
     if len(troughs) >= 2:
         if abs(c['low'] - troughs[-1]) / troughs[-1] < 0.0015 and c['close'] > c['open']:
             return "Double Bottom", "Buy", lowest_low * 0.997
@@ -145,7 +140,6 @@ def detect_chart_patterns(df):
         if c['high'] > peaks[-1] and c['close'] < peaks[-1] and upper_wick > body:
             return "Swing Failure Pattern (SFP) Top", "Sell", c['high'] * 1.002
 
-    # ৩. ফ্ল্যাগ প্যাটার্ন (কনসোলিডেশন জোনের বাইরে SL)
     if len(df) > 30:
         past_move = (df.iloc[-5]['close'] - df.iloc[-25]['close']) / df.iloc[-25]['close']
         consolidation_low = min(df.iloc[-5:]['low'])
@@ -158,9 +152,14 @@ def detect_chart_patterns(df):
     return "No Clear Pattern", "Neutral", None
 
 def check_tp_sl():
+    print("[THREAD] TP/SL Monitoring Thread Started.", flush=True)
     while True:
         try:
-            prices = {coin['symbol']: float(coin['lastPrice']) for coin in scan_all_binance_futures()}
+            all_futures = scan_all_binance_futures()
+            if not all_futures: 
+                time.sleep(5)
+                continue
+            prices = {coin['symbol']: float(coin['lastPrice']) for coin in all_futures}
             for base, trade in list(ACTIVE_TRADES.items()):
                 symbol = base + "USDT"
                 if symbol not in prices: continue
@@ -173,7 +172,6 @@ def check_tp_sl():
                 hit_sl = (is_long and curr <= trade['sl']) or (not is_long and curr >= trade['sl'])
                 
                 if hit_tp or hit_sl:
-                    # ৫০এক্স লেভারেজ প্রফিট/লস হিসাব
                     pnl = trade['tp_pct'] if hit_tp else -trade['sl_pct']
                     tp_inc = 1 if hit_tp else 0
                     sl_inc = 0 if hit_tp else 1
@@ -189,20 +187,29 @@ def check_tp_sl():
                     
                     msg = f"🔰 **${base}/USDT ({tf})** 🔰\n\nResult: {status}\nLeverage: {LEVERAGE}x ⚡\nPnL: {pnl:+.2f}%\nExit Price: {curr:.4f}"
                     bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
-        except:
-            pass
+        except Exception as e:
+            print(f"[ERROR in check_tp_sl]: {e}", flush=True)
         time.sleep(5)
 
 def auto_signal_generator_loop():
+    print("[THREAD] Market Scanner Thread Started.", flush=True)
     while True:
         try:
-            coins = filter_scalping_coins(scan_all_binance_futures())
+            print(f"[SCANNER] Scanning started at {datetime.datetime.now().strftime('%H:%M:%S')}...", flush=True)
+            all_coins = scan_all_binance_futures()
+            if not all_coins:
+                print("[SCANNER] No coin data received from Binance.", flush=True)
+                time.sleep(SCAN_INTERVAL_SECONDS)
+                continue
+                
+            coins = filter_scalping_coins(all_coins)
+            print(f"[SCANNER] Top candidate coins for scanning: {[c['symbol'] for c in coins]}", flush=True)
+            
             for coin in coins[:3]:
                 symbol = coin['symbol']
                 base = symbol.replace("USDT", "")
                 if base in ACTIVE_TRADES: continue
                 
-                # ১ মিনিট এবং ৫ মিনিট—উভয় টাইমফ্রেমেই সিগন্যাল জেনারেট হবে
                 timeframe = random.choice(["1m", "5m"])
                 df = get_klines_dataframe(symbol, timeframe, limit=500)
                 if df is None or len(df) < 100: continue
@@ -211,33 +218,35 @@ def auto_signal_generator_loop():
                 c_candle = df.iloc[-2]
                 current_price = c_candle['close']
                 
-                # চার্ট প্যাটার্ন ও প্যাটার্ন ভিত্তিক স্টপ লস লেভেল বের করা
                 pattern_name, action, pattern_sl = detect_chart_patterns(df)
                 
-                if action == "Neutral" or pattern_sl is None: continue
+                if action == "Neutral" or pattern_sl is None: 
+                    continue
                 
-                # কনফার্মেশন ফিল্টারস
-                if c_candle['volume'] <= c_candle['Vol_SMA']: continue
-                if action == "Buy" and current_price < c_candle['MA']: continue
-                if action == "Sell" and current_price > c_candle['MA']: continue
+                print(f"[MATCH FOUND] {symbol} ({timeframe}) matched Pattern: {pattern_name} | Action: {action}", flush=True)
+                
+                # --- শুধুমাত্র আপনার দেওয়া ভলিউম SMA ১৪ ক্রসের কন্ডিশন রাখা হলো ---
+                if c_candle['volume'] <= c_candle['Vol_SMA']: 
+                    print(f"[FILTER SKIPPED] {symbol} Volume ({c_candle['volume']}) is NOT above Vol_SMA 14 ({c_candle['Vol_SMA']}).", flush=True)
+                    continue
+                
+                # প্রাইস MA এবং ক্যান্ডেলস্টিক পজিশনের অন্য সব শর্ত সম্পূর্ণ বাদ দেওয়া হয়েছে।
                 
                 is_long = action == "Buy"
                 trade_dir_text = "BUY (LONG) 🟢" if is_long else "SELL (SHORT) 🔴"
                 
-                # ---- প্যাটার্ন ওয়াইজ SL এবং কোডের RR অনুযায়ী TP নির্ধারণ ----
                 sl = pattern_sl
                 sl_dist = abs(current_price - sl)
                 
-                # কোডের রিস্ক রিওয়ার্ড রেশিও (RR = 1:2.5) অনুযায়ী TP ফিক্সড করা
                 tp_dist = sl_dist * RISK_REWARD_RATIO
                 tp = current_price + tp_dist if is_long else current_price - tp_dist
                 
-                # ৫০এক্স লেভারেজ প্রফিট পার্সেন্টেজ হিসাব
                 sl_pct = (sl_dist / current_price) * 100 * LEVERAGE
                 tp_pct = (tp_dist / current_price) * 100 * LEVERAGE
                 
-                # সেফটি চেক: যদি এসএল অতিরিক্ত বড় হয়ে যায় তবে ট্রেড স্কিপ করবে
-                if sl_pct > 150: continue 
+                if sl_pct > 150: 
+                    print(f"[FILTER SKIPPED] {symbol} Stop Loss too wide ({sl_pct:.2f}%).", flush=True)
+                    continue 
 
                 signal_msg = (f"🎯 **AI Advanced Price Action Signal** 🔥\n\n"
                               f"Coin: ${base}/USDT\n"
@@ -252,6 +261,7 @@ def auto_signal_generator_loop():
                               f"Time: {datetime.datetime.now().strftime('%H:%M:%S')}")
                               
                 bot.send_message(CHAT_ID, signal_msg, parse_mode='Markdown')
+                print(f"[SUCCESS] Signal sent for {symbol} to channel!", flush=True)
                 
                 ACTIVE_TRADES[base] = {
                     "dir": "LONG" if is_long else "SHORT", 
@@ -259,18 +269,14 @@ def auto_signal_generator_loop():
                     "tp_pct": tp_pct, "sl_pct": sl_pct, "tf": timeframe
                 }
                 break
-        except:
-            pass
+        except Exception as e:
+            print(f"[ERROR in auto_signal_generator_loop]: {e}", flush=True)
         time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==========================================
-#  অটোমেটিক ডেইলি পারফরম্যান্স রিপোর্ট লুপ
-# ==========================================
 def daily_auto_report_loop():
     while True:
         try:
             now = datetime.datetime.now()
-            # প্রতিদিন রাত ১২টায় অটোমেটিক রিপোর্ট সেন্ড হবে
             if now.hour == 0 and now.minute == 0:
                 report_text = "📢 **Daily Automated Performance Report** 📢\n\n"
                 for tf in ["1m", "5m"]:
@@ -289,17 +295,12 @@ def daily_auto_report_loop():
                                     f"• Total Profit/Loss: {pnl:+.2f}% (50x)\n\n")
                 
                 bot.send_message(CHAT_ID, report_text, parse_mode='Markdown')
-                # নতুন দিনের জন্য 'today' ডাটা রিসেট করা
                 STATS_DB["1m"]["today"] = {"signals": 0, "tp_hit": 0, "sl_hit": 0, "pnl": 0.0}
                 STATS_DB["5m"]["today"] = {"signals": 0, "tp_hit": 0, "sl_hit": 0, "pnl": 0.0}
                 time.sleep(60)
-        except:
-            pass
+        except Exception as e:
+            print(f"[ERROR in daily_auto_report_loop]: {e}", flush=True)
         time.sleep(30)
-
-# ==========================================
-#  টেলিগ্রাম বটের কমান্ড হ্যান্ডলারস
-# ==========================================
 
 @bot.message_handler(commands=['start', 'status'])
 def start(msg):
@@ -351,12 +352,16 @@ def manual_close(msg):
         else:
             bot.send_message(msg.chat.id, f"❌ {coin_to_close} খুঁজে পাওয়া যায়নি।")
     except:
-        bot.send_message(msg.chat.id, "⚠️ নিয়ম: `/close SOL`", parse_mode='Markdown')
+        bot.send_message(msg.chat.id, "⚠️ नियम: `/close SOL`", parse_mode='Markdown')
 
 if __name__ == '__main__':
+    print("[START] Initializing Bot Script...", flush=True)
     load_pdf_from_telegram_channel()
     set_bot_commands()
+    
     Thread(target=auto_signal_generator_loop, daemon=True).start()
     Thread(target=check_tp_sl, daemon=True).start()
-    Thread(target=daily_auto_report_loop, daemon=True).start() # অটো রিপোর্টিং থ্রেড সচল করা হলো
+    Thread(target=daily_auto_report_loop, daemon=True).start()
+    
+    print("[START] Telegram Polling Started. Bot is live!", flush=True)
     bot.infinity_polling(none_stop=True)
